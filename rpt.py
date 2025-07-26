@@ -1,8 +1,10 @@
 import pandas as pd
+import openpyxl
 from matplotlib import pyplot as plt
 from docx import Document
-from docx.shared import Inches
+from docx.shared import Inches, Pt
 from docx.enum.table import WD_TABLE_ALIGNMENT
+from docx.enum.text import WD_ALIGN_PARAGRAPH
 from pathlib import Path
 import argparse
 from datetime import datetime
@@ -54,23 +56,46 @@ class ReportGenerator:
                 timestamp = datetime.now().strftime("%H%M%S")
                 return parent_dir / f"{name_stem}_{timestamp}{extension}"
             
-    def read_markdown_file(self, filename):
-        """Read content from a markdown file if it exists"""
+    def read_section_from_content(self, section_name):
+        """Read a specific section from content.md file"""
         try:
-            file_path = Path(filename)
-            if file_path.exists():
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    return f.read().strip()
-            else:
-                print(f"Info: {filename} not found, using default content")
+            content_file = Path('content.md')
+            if not content_file.exists():
+                print(f"Info: content.md not found, using default content")
                 return None
+                
+            with open(content_file, 'r', encoding='utf-8') as f:
+                content = f.read()
+            
+            # Split content by headers (# Section Name)
+            sections = {}
+            current_section = None
+            current_content = []
+            
+            for line in content.split('\n'):
+                if line.startswith('# '):
+                    # Save previous section if exists
+                    if current_section:
+                        sections[current_section] = '\n'.join(current_content).strip()
+                    # Start new section
+                    current_section = line[2:].strip()  # Remove '# '
+                    current_content = []
+                else:
+                    current_content.append(line)
+            
+            # Save last section
+            if current_section:
+                sections[current_section] = '\n'.join(current_content).strip()
+            
+            return sections.get(section_name, None)
+            
         except Exception as e:
-            print(f"Error reading {filename}: {e}")
+            print(f"Error reading content.md: {e}")
             return None
 
-    def add_markdown_content(self, filename, default_content=None):
-        """Add content from markdown file to document with basic formatting"""
-        content = self.read_markdown_file(filename)
+    def add_markdown_content(self, section_name, default_content=None):
+        """Add content from content.md section to document with basic formatting"""
+        content = self.read_section_from_content(section_name)
 
         if not content and default_content:
             content = default_content
@@ -85,7 +110,7 @@ class ReportGenerator:
             if not para:
                 continue
 
-            # Handle bullet points (markdown style)
+            # Handle bullet points (markdown style) - removed bold formatting
             if para.startswith('- ') or para.startswith('* '):
                 # Split multiple bullet points
                 bullets = [line.strip()[2:] for line in para.split(
@@ -121,14 +146,27 @@ class ReportGenerator:
 
     def add_introduction(self):
         """Add introduction section"""
-        self.document.add_heading('Executive Summary', level=1)
+        self.document.add_heading('Summary', level=1)
 
         default_intro = f"""This report provides a comprehensive overview of budget allocation and expenditure status as of {datetime.now().strftime("%B %d, %Y")}.
 
 Key metrics include budget utilization rates, remaining fund allocation, and project-specific financial performance indicators."""
 
-        self.add_markdown_content('introduction.md', default_intro)
-        print("✅ Introduction section added")
+        self.add_markdown_content('Summary', default_intro)
+        print("✅ Summary section added")
+
+    def add_deliverables_progress(self):
+        """Add deliverables progress section"""
+        self.document.add_heading('Deliverables Progress', level=1)
+
+        default_deliverables = """Progress on key project deliverables remains on track with established timelines.
+
+- Major milestones achieved during this reporting period
+- Current status of ongoing deliverables
+- Any adjustments to delivery schedules"""
+
+        self.add_markdown_content('Deliverables Progress', default_deliverables)
+        print("✅ Deliverables Progress section added")
 
     def add_budget_table(self):
         """Add budget data table"""
@@ -136,7 +174,7 @@ Key metrics include budget utilization rates, remaining fund allocation, and pro
             print("❌ No data available for table")
             return False
 
-        self.document.add_heading('Budget Allocation Details', level=1)
+        self.document.add_heading('Budget', level=1)
 
         # Add summary paragraph
         total_budgeted = self.data['Budgeted'].sum(
@@ -151,7 +189,20 @@ Key metrics include budget utilization rates, remaining fund allocation, and pro
 
         # Create table
         table = self.document.add_table(rows=1, cols=len(self.data.columns))
-        table.style = 'Table Grid'
+        # Remove table borders completely
+        table.style = None  # This removes borders
+        
+        # Remove all borders from table
+        for row in table.rows:
+            for cell in row.cells:
+                for paragraph in cell.paragraphs:
+                    paragraph.style.font.size = Pt(11)
+                # Remove cell borders
+                tc = cell._tc
+                tcPr = tc.get_or_add_tcPr()
+                tcBorders = tcPr.find('.//{http://schemas.openxmlformats.org/wordprocessingml/2006/main}tcBorders')
+                if tcBorders is not None:
+                    tcPr.remove(tcBorders)
 
         # Add header row with bold formatting
         hdr_cells = table.rows[0].cells
@@ -161,10 +212,22 @@ Key metrics include budget utilization rates, remaining fund allocation, and pro
             for paragraph in hdr_cells[i].paragraphs:
                 for run in paragraph.runs:
                     run.bold = True
+                # Right-justify headers in columns 1, 2, 3 (Budgeted, Spent, Remaining)
+                if i in [1, 2, 3]:
+                    paragraph.alignment = WD_ALIGN_PARAGRAPH.RIGHT
 
         # Add data rows
         for i in range(len(self.data)):
             row_cells = table.add_row().cells
+            
+            # Remove borders from new row cells
+            for cell in row_cells:
+                tc = cell._tc
+                tcPr = tc.get_or_add_tcPr()
+                tcBorders = tcPr.find('.//{http://schemas.openxmlformats.org/wordprocessingml/2006/main}tcBorders')
+                if tcBorders is not None:
+                    tcPr.remove(tcBorders)
+            
             for j in range(len(self.data.columns)):
                 cell_value = self.data.iloc[i, j]
                 # Format numbers with commas if they're numeric
@@ -173,14 +236,27 @@ Key metrics include budget utilization rates, remaining fund allocation, and pro
                         cell_value) else f"{cell_value:,.2f}"
                 else:
                     row_cells[j].text = str(cell_value)
+                
+                # Right-justify numeric columns (Budgeted, Spent, Remaining - columns 1, 2, 3)
+                if j in [1, 2, 3]:  # Assuming these are the numeric columns
+                    for paragraph in row_cells[j].paragraphs:
+                        paragraph.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+                
+                # Bold the bottom row (totals) if it contains "TOTAL"
+                if 'TOTAL' in str(self.data.iloc[i, 0]).upper():
+                    for paragraph in row_cells[j].paragraphs:
+                        for run in paragraph.runs:
+                            run.bold = True
 
         print("✅ Budget table added")
         return True
 
     def add_key_points(self):
         """Add key points section"""
-        self.document.add_heading('Key Findings', level=1)
-
+        # Add space and intro sentence
+        self.document.add_paragraph("")  # Empty paragraph for spacing
+        self.document.add_paragraph("Summary of budget status:")
+        
         # Generate dynamic key points based on data
         key_points = []
 
@@ -220,7 +296,7 @@ Key metrics include budget utilization rates, remaining fund allocation, and pro
             ]
 
         default_key_points = "\n".join([f"- {point}" for point in key_points])
-        self.add_markdown_content('key_points.md', default_key_points)
+        self.add_markdown_content('key_points', default_key_points)
 
         print("✅ Key points section added")
 
@@ -230,11 +306,9 @@ Key metrics include budget utilization rates, remaining fund allocation, and pro
             print("❌ No data available for chart")
             return False
 
-        self.document.add_heading('Budget Visualization', level=1)
-
         # Add chart description
-        chart_desc = "The chart below provides a visual comparison of budgeted amounts versus remaining funds for each project component."
-        self.add_markdown_content('chart_description.md', chart_desc)
+        chart_desc = "Figure 1 provides a visual comparison of budgeted amounts versus remaining funds for each project component."
+        self.add_markdown_content('chart_description', chart_desc)
 
         try:
             # Set matplotlib to non-interactive backend to prevent chart from showing
@@ -277,6 +351,11 @@ Key metrics include budget utilization rates, remaining fund allocation, and pro
 
             # Add to document
             self.document.add_picture(chart_filename, width=Inches(6.5))
+            
+            # Add figure caption in 9pt font
+            caption_paragraph = self.document.add_paragraph("Figure 1: Total amounts budgeted and remaining by project task.")
+            caption_run = caption_paragraph.runs[0]
+            caption_run.font.size = Pt(9)
 
             # Close the figure to prevent display and free memory
             plt.close()
@@ -287,6 +366,32 @@ Key metrics include budget utilization rates, remaining fund allocation, and pro
         except Exception as e:
             print(f"❌ Error creating chart: {e}")
             return False
+
+    def add_challenges(self):
+        """Add challenges section"""
+        self.document.add_heading('Challenges', level=1)
+
+        default_challenges = """Current challenges and mitigation strategies:
+
+- Resource allocation constraints and proposed solutions
+- Technical obstacles encountered and resolution approaches
+- Timeline adjustments required due to external factors"""
+
+        self.add_markdown_content('Challenges', default_challenges)
+        print("✅ Challenges section added")
+
+    def add_next_period_activities(self):
+        """Add next period activities section"""
+        self.document.add_heading('Next Period Activities', level=1)
+
+        default_next_period = """Planned activities for the upcoming reporting period:
+
+- Priority tasks and deliverables for next phase
+- Resource requirements and allocation plans
+- Key milestones and target completion dates"""
+
+        self.add_markdown_content('Next Period Activities', default_next_period)
+        print("✅ Next Period Activities section added")
 
     def save_document(self):
         """Save the Word document"""
@@ -311,9 +416,12 @@ Key metrics include budget utilization rates, remaining fund allocation, and pro
 
         # Add sections
         self.add_introduction()
+        self.add_deliverables_progress()
         self.add_budget_table()
         self.add_key_points()
         self.add_budget_chart()
+        self.add_challenges()
+        self.add_next_period_activities()
 
         # Save document
         success = self.save_document()
