@@ -1,9 +1,7 @@
 import pandas as pd
-import openpyxl
 from matplotlib import pyplot as plt
 from docx import Document
 from docx.shared import Inches, Pt
-from docx.enum.table import WD_TABLE_ALIGNMENT
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from pathlib import Path
 import argparse
@@ -14,6 +12,9 @@ import os
 class ReportGenerator:
     def __init__(self, excel_file='budget.xlsx', output_file=None):
         self.excel_file = excel_file
+        self.document = None
+        self.data = None
+        self._content_sections = None  # Cache for content.md sections
 
         # Create reports directory if it doesn't exist
         reports_dir = Path('reports')
@@ -27,9 +28,6 @@ class ReportGenerator:
         else:
             # If custom filename provided, still put it in reports folder
             self.output_file = str(reports_dir / output_file)
-
-        self.document = None
-        self.data = None
 
     def _get_unique_filename(self, base_filepath):
         """Ensure unique filename by adding increment if file exists"""
@@ -56,13 +54,17 @@ class ReportGenerator:
                 timestamp = datetime.now().strftime("%H%M%S")
                 return parent_dir / f"{name_stem}_{timestamp}{extension}"
             
-    def read_section_from_content(self, section_name):
-        """Read a specific section from content.md file"""
+    def _load_content_sections(self):
+        """Load and cache all sections from content.md file once"""
+        if self._content_sections is not None:
+            return self._content_sections
+            
         try:
             content_file = Path('content.md')
             if not content_file.exists():
                 print(f"Info: content.md not found, using default content")
-                return None
+                self._content_sections = {}
+                return self._content_sections
                 
             with open(content_file, 'r', encoding='utf-8') as f:
                 content = f.read()
@@ -87,11 +89,18 @@ class ReportGenerator:
             if current_section:
                 sections[current_section] = '\n'.join(current_content).strip()
             
-            return sections.get(section_name, None)
+            self._content_sections = sections
+            return self._content_sections
             
         except Exception as e:
             print(f"Error reading content.md: {e}")
-            return None
+            self._content_sections = {}
+            return self._content_sections
+
+    def read_section_from_content(self, section_name):
+        """Read a specific section from cached content.md sections"""
+        sections = self._load_content_sections()
+        return sections.get(section_name, None)
 
     def add_markdown_content(self, section_name, default_content=None):
         """Add content from content.md section to document with basic formatting"""
@@ -120,6 +129,37 @@ class ReportGenerator:
             else:
                 # Regular paragraph
                 self.document.add_paragraph(para)
+
+    def _remove_table_borders(self, table):
+        """Efficiently remove borders from table"""
+        # Set table style to None to remove default borders
+        table.style = None
+        
+        # Remove borders at XML level for all existing and new cells
+        for row in table.rows:
+            for cell in row.cells:
+                tc = cell._tc
+                tcPr = tc.get_or_add_tcPr()
+                # Remove borders if they exist
+                tcBorders = tcPr.find('.//{http://schemas.openxmlformats.org/wordprocessingml/2006/main}tcBorders')
+                if tcBorders is not None:
+                    tcPr.remove(tcBorders)
+
+    def _format_cell_alignment(self, cell, column_index, is_header=False, is_total_row=False):
+        """Efficiently format cell alignment and styling"""
+        for paragraph in cell.paragraphs:
+            # Set font size
+            if paragraph.runs:
+                paragraph.runs[0].font.size = Pt(11)
+            
+            # Right-align numeric columns (1, 2, 3)
+            if column_index in [1, 2, 3]:
+                paragraph.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+            
+            # Bold formatting for headers and totals
+            if is_header or is_total_row:
+                for run in paragraph.runs:
+                    run.bold = True
 
     def load_data(self):
         """Load budget data from Excel file"""
@@ -189,38 +229,21 @@ Key metrics include budget utilization rates, remaining fund allocation, and pro
 
         # Create table
         table = self.document.add_table(rows=1, cols=len(self.data.columns))
-        # Remove table borders completely
-        table.style = None  # This removes borders
         
-        # Remove all borders from table
-        for row in table.rows:
-            for cell in row.cells:
-                for paragraph in cell.paragraphs:
-                    paragraph.style.font.size = Pt(11)
-                # Remove cell borders
-                tc = cell._tc
-                tcPr = tc.get_or_add_tcPr()
-                tcBorders = tcPr.find('.//{http://schemas.openxmlformats.org/wordprocessingml/2006/main}tcBorders')
-                if tcBorders is not None:
-                    tcPr.remove(tcBorders)
+        # Remove all borders efficiently
+        self._remove_table_borders(table)
 
-        # Add header row with bold formatting
+        # Add header row with formatting
         hdr_cells = table.rows[0].cells
         for i, column_name in enumerate(self.data.columns):
             hdr_cells[i].text = str(column_name)
-            # Make header text bold
-            for paragraph in hdr_cells[i].paragraphs:
-                for run in paragraph.runs:
-                    run.bold = True
-                # Right-justify headers in columns 1, 2, 3 (Budgeted, Spent, Remaining)
-                if i in [1, 2, 3]:
-                    paragraph.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+            self._format_cell_alignment(hdr_cells[i], i, is_header=True)
 
-        # Add data rows
-        for i in range(len(self.data)):
+        # Add data rows efficiently
+        for i, row_data in self.data.iterrows():
             row_cells = table.add_row().cells
             
-            # Remove borders from new row cells
+            # Remove borders from new row
             for cell in row_cells:
                 tc = cell._tc
                 tcPr = tc.get_or_add_tcPr()
@@ -228,25 +251,17 @@ Key metrics include budget utilization rates, remaining fund allocation, and pro
                 if tcBorders is not None:
                     tcPr.remove(tcBorders)
             
-            for j in range(len(self.data.columns)):
-                cell_value = self.data.iloc[i, j]
-                # Format numbers with commas if they're numeric
+            is_total_row = 'TOTAL' in str(row_data.iloc[0]).upper()
+            
+            for j, cell_value in enumerate(row_data):
+                # Format numbers with commas if numeric
                 if pd.api.types.is_numeric_dtype(type(cell_value)) and pd.notna(cell_value):
-                    row_cells[j].text = f"{cell_value:,.0f}" if cell_value == int(
-                        cell_value) else f"{cell_value:,.2f}"
+                    row_cells[j].text = f"{cell_value:,.0f}" if cell_value == int(cell_value) else f"{cell_value:,.2f}"
                 else:
                     row_cells[j].text = str(cell_value)
                 
-                # Right-justify numeric columns (Budgeted, Spent, Remaining - columns 1, 2, 3)
-                if j in [1, 2, 3]:  # Assuming these are the numeric columns
-                    for paragraph in row_cells[j].paragraphs:
-                        paragraph.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-                
-                # Bold the bottom row (totals) if it contains "TOTAL"
-                if 'TOTAL' in str(self.data.iloc[i, 0]).upper():
-                    for paragraph in row_cells[j].paragraphs:
-                        for run in paragraph.runs:
-                            run.bold = True
+                # Apply formatting
+                self._format_cell_alignment(row_cells[j], j, is_total_row=is_total_row)
 
         print("✅ Budget table added")
         return True
@@ -260,24 +275,25 @@ Key metrics include budget utilization rates, remaining fund allocation, and pro
         # Generate dynamic key points based on data
         key_points = []
 
-        if self.data is not None and 'Budgeted' in self.data.columns and 'Remaining' in self.data.columns:
-            # Calculate insights
+        if self.data is not None and all(col in self.data.columns for col in ['Budgeted', 'Remaining']):
+            # Calculate insights efficiently
             total_budgeted = self.data['Budgeted'].sum()
             total_remaining = self.data['Remaining'].sum()
-            utilization_rate = ((total_budgeted - total_remaining) /
-                                total_budgeted * 100) if total_budgeted > 0 else 0
+            utilization_rate = ((total_budgeted - total_remaining) / total_budgeted * 100) if total_budgeted > 0 else 0
 
-            # Find highest and lowest utilization tasks
-            self.data['Utilization%'] = (
-                (self.data['Budgeted'] - self.data['Remaining']) / self.data['Budgeted'] * 100).round(1)
+            # Find highest and lowest utilization tasks efficiently
+            self.data['Utilization%'] = ((self.data['Budgeted'] - self.data['Remaining']) / self.data['Budgeted'] * 100).round(1)
 
             if len(self.data) > 1:
-                non_total_data = self.data[self.data['Task'] !='TOTALS'] if 'Task' in self.data.columns else self.data
+                # Filter out totals row efficiently
+                non_total_data = self.data[~self.data['Task'].str.contains('TOTAL', case=False, na=False)] if 'Task' in self.data.columns else self.data
+                
                 if len(non_total_data) > 0:
-                    highest_util = non_total_data.loc[non_total_data['Utilization%'].idxmax(
-                    )]
-                    lowest_util = non_total_data.loc[non_total_data['Utilization%'].idxmin(
-                    )]
+                    highest_util_idx = non_total_data['Utilization%'].idxmax()
+                    lowest_util_idx = non_total_data['Utilization%'].idxmin()
+                    
+                    highest_util = non_total_data.loc[highest_util_idx]
+                    lowest_util = non_total_data.loc[lowest_util_idx]
 
                     key_points = [
                         f"Overall budget utilization stands at {utilization_rate:.1f}%",
@@ -315,39 +331,35 @@ Key metrics include budget utilization rates, remaining fund allocation, and pro
             plt.ioff()
 
             # Filter out TOTALS row for better visualization
-            chart_data = self.data[self.data['Task'] !='TOTALS'] if 'Task' in self.data.columns else self.data
+            chart_data = self.data[~self.data['Task'].str.contains('TOTAL', case=False, na=False)] if 'Task' in self.data.columns else self.data
 
             if len(chart_data) == 0:
                 chart_data = self.data
 
-            # Create grouped bar chart
-            ax = chart_data.plot(kind='bar',
-                x='Task' if 'Task' in chart_data.columns else chart_data.index,
-                y=['Budgeted', 'Remaining'],
-                stacked=False,
-            # Sea green and royal blue
-                color=['#2E8B57', '#4169E1'],
-                figsize=(12, 8))
-
-            plt.title('Budget Status by Task', fontsize=16, fontweight='bold', pad=20)
-            plt.xlabel('Project Tasks', fontsize=12)
-            plt.ylabel('Amount ($)', fontsize=12)
-            plt.xticks(rotation=45, ha='right')
-            plt.legend(['Budgeted', 'Remaining'], loc='upper right')
-
-            # Format y-axis with thousands separators
-            ax.yaxis.set_major_formatter(
-                plt.FuncFormatter(lambda x, p: f'{x:,.0f}'))
-
-            # Add grid for better readability
-            plt.grid(axis='y', alpha=0.3)
+            # Create chart more efficiently
+            fig, ax = plt.subplots(figsize=(12, 8))
+            
+            # Plot data
+            x_pos = range(len(chart_data))
+            ax.bar([x - 0.2 for x in x_pos], chart_data['Budgeted'], 0.4, label='Budgeted', color='#2E8B57')
+            ax.bar([x + 0.2 for x in x_pos], chart_data['Remaining'], 0.4, label='Remaining', color='#4169E1')
+            
+            # Formatting
+            ax.set_title('Budget Status by Task', fontsize=16, fontweight='bold', pad=20)
+            ax.set_xlabel('Project Tasks', fontsize=12)
+            ax.set_ylabel('Amount ($)', fontsize=12)
+            ax.set_xticks(x_pos)
+            ax.set_xticklabels(chart_data['Task'] if 'Task' in chart_data.columns else chart_data.index, 
+                              rotation=45, ha='right')
+            ax.legend(loc='upper right')
+            ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'{x:,.0f}'))
+            ax.grid(axis='y', alpha=0.3)
 
             plt.tight_layout()
 
             # Save chart
             chart_filename = 'budget_chart.png'
-            plt.savefig(chart_filename, bbox_inches='tight',
-                        dpi=300, facecolor='white')
+            plt.savefig(chart_filename, bbox_inches='tight', dpi=300, facecolor='white')
 
             # Add to document
             self.document.add_picture(chart_filename, width=Inches(6.5))
@@ -358,7 +370,7 @@ Key metrics include budget utilization rates, remaining fund allocation, and pro
             caption_run.font.size = Pt(9)
 
             # Close the figure to prevent display and free memory
-            plt.close()
+            plt.close(fig)
 
             print("✅ Budget chart added")
             return True
